@@ -17,12 +17,32 @@ from __future__ import annotations
 import pytest
 
 from rag_agent.agent.state import ChunkMetadata, DocumentChunk
+from rag_agent.config import Settings
 from rag_agent.vectorstore.store import VectorStoreManager
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def test_settings(tmp_path, monkeypatch) -> Settings:
+    """Isolated Chroma path and test-friendly retrieval thresholds.
+
+    BaseSettings reads .env / OS env, which otherwise overrides kwargs and
+    points tests at the developer's real ./data/chroma_db.
+    """
+    monkeypatch.setenv("CHROMA_DB_PATH", str(tmp_path / "chroma_db"))
+    monkeypatch.setenv("CHROMA_COLLECTION_NAME", "test_dl_corpus")
+    monkeypatch.setenv("RETRIEVAL_K", "5")
+    monkeypatch.setenv("SIMILARITY_THRESHOLD", "0.25")
+    return Settings()
+
+
+@pytest.fixture
+def store(test_settings: Settings) -> VectorStoreManager:
+    return VectorStoreManager(settings=test_settings)
 
 
 @pytest.fixture
@@ -118,27 +138,27 @@ class TestDuplicateDetection:
     """
 
     def test_new_chunk_is_not_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self, store: VectorStoreManager, sample_chunk: DocumentChunk
     ) -> None:
         """A chunk that has never been ingested must not be flagged as duplicate."""
-        # TODO: implement using a test ChromaDB path in tmp_path
-        # store = VectorStoreManager(settings=test_settings(chroma_db_path=tmp_path))
-        # assert store.check_duplicate(sample_chunk.chunk_id) is False
-        pytest.skip("Implement after VectorStoreManager is complete")
+        assert store.check_duplicate(sample_chunk.chunk_id) is False
 
     def test_ingested_chunk_is_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self, store: VectorStoreManager, sample_chunk: DocumentChunk
     ) -> None:
         """A chunk that has been ingested must be flagged as duplicate on re-check."""
-        # TODO: ingest chunk, then check_duplicate → True
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store.ingest([sample_chunk])
+        assert store.check_duplicate(sample_chunk.chunk_id) is True
 
     def test_ingestion_skips_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self, store: VectorStoreManager, sample_chunk: DocumentChunk
     ) -> None:
         """Ingesting the same chunk twice must result in skipped=1 on second call."""
-        # TODO: ingest once, ingest again, check IngestionResult.skipped == 1
-        pytest.skip("Implement after VectorStoreManager is complete")
+        first = store.ingest([sample_chunk])
+        assert first.ingested == 1
+        second = store.ingest([sample_chunk])
+        assert second.skipped == 1
+        assert second.ingested == 0
 
 
 # ---------------------------------------------------------------------------
@@ -155,37 +175,75 @@ class TestRetrieval:
     """
 
     def test_relevant_query_returns_results(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self, store: VectorStoreManager, sample_chunk: DocumentChunk
     ) -> None:
         """A query semantically similar to an ingested chunk must return results."""
-        # TODO: ingest sample_chunk, query "LSTM gate mechanism", assert len > 0
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store.ingest([sample_chunk])
+        hits = store.query("LSTM forget gate mechanism vanishing gradient")
+        assert len(hits) > 0
 
-    def test_irrelevant_query_returns_empty(self, tmp_path) -> None:
+    def test_irrelevant_query_returns_empty(
+        self,
+        sample_chunk: DocumentChunk,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
         """
         A query with no semantic similarity to the corpus must return empty list.
 
         This tests the hallucination guard threshold. The system must return
         an empty list — not low-quality chunks — when nothing matches.
         """
-        # TODO: ingest sample_chunk, query "history of the roman empire"
-        # assert result == []
-        pytest.skip("Implement after VectorStoreManager is complete")
+        monkeypatch.setenv("CHROMA_DB_PATH", str(tmp_path / "chroma_strict"))
+        monkeypatch.setenv("CHROMA_COLLECTION_NAME", "test_dl_corpus_strict")
+        monkeypatch.setenv("SIMILARITY_THRESHOLD", "0.85")
+        monkeypatch.setenv("RETRIEVAL_K", "5")
+        store = VectorStoreManager(settings=Settings())
+        store.ingest([sample_chunk])
+        hits = store.query("history of the roman empire marble monuments")
+        assert hits == []
 
     def test_topic_filter_restricts_results(
         self,
-        tmp_path,
+        store: VectorStoreManager,
         sample_chunk: DocumentChunk,
         bonus_chunk: DocumentChunk,
     ) -> None:
         """Results with topic_filter='LSTM' must not include GAN chunks."""
-        # TODO: ingest both chunks, query with topic_filter="LSTM"
-        # assert all(c.metadata.topic == "LSTM" for c in results)
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store.ingest([sample_chunk, bonus_chunk])
+        hits = store.query(
+            "neural network architecture training",
+            topic_filter="LSTM",
+        )
+        assert hits
+        assert all(c.metadata.topic == "LSTM" for c in hits)
 
     def test_results_sorted_by_score_descending(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self, store: VectorStoreManager, sample_chunk: DocumentChunk
     ) -> None:
         """Retrieved chunks must be sorted with highest similarity first."""
-        # TODO: ingest multiple chunks, verify scores are non-increasing
-        pytest.skip("Implement after VectorStoreManager is complete")
+        meta2 = ChunkMetadata(
+            topic="LSTM",
+            difficulty="intermediate",
+            type="architecture",
+            source="test_lstm_extra.md",
+            related_topics=["RNN"],
+            is_bonus=False,
+        )
+        extra = DocumentChunk(
+            chunk_id=VectorStoreManager.generate_chunk_id(
+                "test_lstm_extra.md",
+                "The output gate in an LSTM decides what parts of the cell state "
+                "are exposed to the next hidden state and downstream layers.",
+            ),
+            chunk_text=(
+                "The output gate in an LSTM decides what parts of the cell state "
+                "are exposed to the next hidden state and downstream layers."
+            ),
+            metadata=meta2,
+        )
+        store.ingest([sample_chunk, extra])
+        hits = store.query("LSTM output gate cell state hidden state", k=4)
+        assert len(hits) >= 2
+        scores = [h.score for h in hits]
+        assert scores == sorted(scores, reverse=True)

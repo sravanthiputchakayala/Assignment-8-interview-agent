@@ -12,15 +12,23 @@ PEP 8 | OOP | Single Responsibility
 
 from __future__ import annotations
 
+import tiktoken
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
 
-from rag_agent.agent.prompts import (
-    QUESTION_GENERATION_PROMPT,
-    SYSTEM_PROMPT,
-)
+from rag_agent.agent.prompts import QUERY_REWRITE_PROMPT, SYSTEM_PROMPT
 from rag_agent.agent.state import AgentResponse, AgentState, RetrievedChunk
 from rag_agent.config import LLMFactory, get_settings
-from rag_agent.vectorstore.store import VectorStoreManager
+from rag_agent.vectorstore.store import get_default_vector_store
+
+
+def _last_human_text(state: AgentState) -> str:
+    messages = state.get("messages") or []
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content
+            return c if isinstance(c, str) else str(c)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -32,19 +40,6 @@ def query_rewrite_node(state: AgentState) -> dict:
     """
     Rewrite the user's query to maximise retrieval effectiveness.
 
-    Natural language questions are often poorly suited for vector
-    similarity search. This node rephrases the query into a form
-    that produces better embedding matches against the corpus.
-
-    Example
-    -------
-    Input:  "I'm confused about how LSTMs remember things long-term"
-    Output: "LSTM long-term memory cell state forget gate mechanism"
-
-    Interview talking point: query rewriting is a production RAG pattern
-    that significantly improves retrieval recall. It acknowledges that
-    users do not phrase queries the way documents are written.
-
     Parameters
     ----------
     state : AgentState
@@ -55,16 +50,22 @@ def query_rewrite_node(state: AgentState) -> dict:
     dict
         Updates: original_query, rewritten_query.
     """
-    # TODO: implement
-    # 1. Extract the latest HumanMessage from state.messages as original_query
-    # 2. Build a short prompt instructing the LLM to rewrite for vector search
-    #    Keep the rewriting prompt lightweight — this adds latency
-    # 3. Call llm.invoke() with the rewrite prompt
-    # 4. Return {"original_query": original_query, "rewritten_query": rewritten}
-    #
-    # Fallback: if rewriting fails (API error, timeout), return the original
-    # query unchanged so the graph continues gracefully
-    raise NotImplementedError
+    original = _last_human_text(state).strip()
+    if not original:
+        return {"original_query": "", "rewritten_query": ""}
+
+    llm = LLMFactory().create()
+    prompt = QUERY_REWRITE_PROMPT.format(original_query=original)
+    try:
+        out = llm.invoke(prompt)
+        text = getattr(out, "content", str(out))
+        rewritten = text.strip() if isinstance(text, str) else str(text).strip()
+    except Exception:
+        rewritten = original
+
+    if not rewritten:
+        rewritten = original
+    return {"original_query": original, "rewritten_query": rewritten}
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +81,6 @@ def retrieval_node(state: AgentState) -> dict:
     threshold. This flag is checked by generation_node to trigger
     the hallucination guard.
 
-    Interview talking point: separating retrieval into its own node
-    makes it independently testable and replaceable — you could swap
-    ChromaDB for Pinecone or Weaviate by changing only this node.
-
     Parameters
     ----------
     state : AgentState
@@ -95,16 +92,19 @@ def retrieval_node(state: AgentState) -> dict:
     dict
         Updates: retrieved_chunks, no_context_found.
     """
-    # TODO: implement
-    # 1. Instantiate VectorStoreManager (consider caching this)
-    # 2. manager.query(
-    #        query_text=state.rewritten_query,
-    #        topic_filter=state.topic_filter,
-    #        difficulty_filter=state.difficulty_filter
-    #    )
-    # 3. If result is empty: return {"retrieved_chunks": [], "no_context_found": True}
-    # 4. Otherwise: return {"retrieved_chunks": chunks, "no_context_found": False}
-    raise NotImplementedError
+    manager = get_default_vector_store()
+    q = (state.get("rewritten_query") or state.get("original_query") or "").strip()
+    if not q:
+        return {"retrieved_chunks": [], "no_context_found": True}
+
+    chunks: list[RetrievedChunk] = manager.query(
+        q,
+        topic_filter=state.get("topic_filter"),
+        difficulty_filter=state.get("difficulty_filter"),
+    )
+    if not chunks:
+        return {"retrieved_chunks": [], "no_context_found": True}
+    return {"retrieved_chunks": chunks, "no_context_found": False}
 
 
 # ---------------------------------------------------------------------------
@@ -116,25 +116,12 @@ def generation_node(state: AgentState) -> dict:
     """
     Generate the final response using retrieved chunks as context.
 
-    Implements the hallucination guard: if no_context_found is True,
-    returns a clear "no relevant context" message rather than allowing
-    the LLM to answer from parametric memory.
-
-    Implements token-aware conversation memory trimming: when the
-    message history approaches max_context_tokens, the oldest
-    non-system messages are removed.
-
-    Interview talking point: the hallucination guard is the most
-    commonly asked about production RAG pattern. Interviewers want
-    to know how you prevent the model from confidently making up
-    information when the retrieval step finds nothing relevant.
+    Implements the hallucination guard when no_context_found is True.
 
     Parameters
     ----------
     state : AgentState
         Current graph state.
-        Reads: retrieved_chunks, no_context_found, messages,
-               original_query, topic_filter.
 
     Returns
     -------
@@ -144,8 +131,7 @@ def generation_node(state: AgentState) -> dict:
     settings = get_settings()
     llm = LLMFactory(settings).create()
 
-    # ---- Hallucination Guard -----------------------------------------------
-    if state.no_context_found:
+    if state.get("no_context_found"):
         no_context_message = (
             "I was unable to find relevant information in the corpus for your query. "
             "This may mean the topic is not yet covered in the study material, or "
@@ -157,28 +143,70 @@ def generation_node(state: AgentState) -> dict:
             sources=[],
             confidence=0.0,
             no_context_found=True,
-            rewritten_query=state.rewritten_query,
+            rewritten_query=str(state.get("rewritten_query") or ""),
         )
         return {
             "final_response": response,
             "messages": [AIMessage(content=no_context_message)],
         }
 
-    # ---- Build Context from Retrieved Chunks --------------------------------
-    # TODO: implement
-    # 1. Format retrieved chunks into a context string with citations
-    #    Each chunk should appear as: "[SOURCE: topic | file]\n{chunk_text}\n"
-    # 2. Calculate average confidence score from chunk scores
-    # 3. Build the full prompt:
-    #    - SystemMessage with SYSTEM_PROMPT
-    #    - Context message with formatted chunks
-    #    - Trimmed conversation history (trim to max_context_tokens)
-    #    - HumanMessage with original_query
-    # 4. llm.invoke(messages)
-    # 5. Construct AgentResponse with answer, sources (list of citations), confidence
-    # 6. Append AIMessage to messages
-    # 7. Return {"final_response": response, "messages": [new_ai_message]}
-    raise NotImplementedError
+    chunks: list[RetrievedChunk] = state.get("retrieved_chunks") or []
+    context = "\n\n".join(
+        f"{c.to_citation()}\n{c.chunk_text}" for c in chunks
+    )
+    avg_confidence = (
+        sum(c.score for c in chunks) / len(chunks) if chunks else 0.0
+    )
+    sources = [c.to_citation() for c in chunks]
+    original_q = str(state.get("original_query") or _last_human_text(state))
+
+    prior = list(state.get("messages") or [])
+    context_tokens = len(tiktoken.get_encoding("cl100k_base").encode(context))
+    history_budget = max(
+        400,
+        settings.max_context_tokens - context_tokens - 400,
+    )
+    trimmed = trim_messages(
+        prior,
+        max_tokens=history_budget,
+        strategy="last",
+        token_counter=count_tokens_approximately,
+        start_on="human",
+        include_system=False,
+    )
+
+    user_turn = HumanMessage(
+        content=(
+            "Use ONLY the retrieved context below. Cite sources as "
+            "[SOURCE: topic | filename] for every factual claim.\n\n"
+            f"{context}\n\nUser question:\n{original_q}"
+        )
+    )
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + trimmed + [user_turn]
+
+    try:
+        ai_msg = llm.invoke(messages)
+        answer_text = ai_msg.content if isinstance(ai_msg.content, str) else str(
+            ai_msg.content
+        )
+    except Exception as e:
+        answer_text = (
+            f"The model failed to generate a response ({e!s}). "
+            "Check your LLM provider configuration in .env."
+        )
+        ai_msg = AIMessage(content=answer_text)
+
+    response = AgentResponse(
+        answer=answer_text,
+        sources=sources,
+        confidence=float(avg_confidence),
+        no_context_found=False,
+        rewritten_query=str(state.get("rewritten_query") or ""),
+    )
+    return {
+        "final_response": response,
+        "messages": [ai_msg if isinstance(ai_msg, AIMessage) else AIMessage(content=answer_text)],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -188,33 +216,7 @@ def generation_node(state: AgentState) -> dict:
 
 def should_retry_retrieval(state: AgentState) -> str:
     """
-    Conditional edge function: decide whether to retry retrieval or generate.
-
-    Called by the graph after retrieval_node. If no context was found,
-    the graph routes back to query_rewrite_node for one retry with a
-    broader query before triggering the hallucination guard.
-
-    Interview talking point: conditional edges in LangGraph enable
-    agentic behaviour — the graph makes decisions about its own
-    execution path rather than following a fixed sequence.
-
-    Parameters
-    ----------
-    state : AgentState
-        Current graph state. Reads: no_context_found, retrieved_chunks.
-
-    Returns
-    -------
-    str
-        "generate" — proceed to generation_node.
-        "end"      — skip generation, return no_context response directly.
-
-    Notes
-    -----
-    Retry logic should be limited to one attempt to prevent infinite loops.
-    Track retry count in AgentState if implementing retry behaviour.
+    Route after retrieval. Always continue to generation so the
+    hallucination guard and user-facing message stay in one place.
     """
-    # TODO: implement
-    # Simple version: if no_context_found → "end", else → "generate"
-    # Advanced version: track retry count, allow one retry with broader query
-    raise NotImplementedError
+    return "generate"

@@ -109,9 +109,9 @@ and why.
 Before doing anything else, confirm your role with your team.
 Then jump directly to your role's section below.
 
-| Role | You Own | Go To |
-|---|---|---|
-| **Corpus Architect** | `data/corpus/` | [→ Corpus Architect](#corpus-architect) |
+| Role | You Own | Go To | Names |
+|---|---|---|---|
+| **Corpus Architect** | `data/corpus/` | [→ Corpus Architect](#corpus-architect) | 
 | **Pipeline Engineer** | `config.py`, `store.py`, `nodes.py`, `graph.py` | [→ Pipeline Engineer](#pipeline-engineer) |
 | **UX Lead** | `ui/app.py` | [→ UX Lead](#ux-lead) |
 | **Prompt Engineer** | `prompts.py` | [→ Prompt Engineer](#prompt-engineer) |
